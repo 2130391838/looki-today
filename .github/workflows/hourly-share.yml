@@ -1,0 +1,105 @@
+name: hourly-share
+
+# 为什么不是纯 schedule：GitHub 免费版对 schedule 大幅降频（实测一天只触发 2 次，
+# 而不是 12 次），页面会隔好几个小时不动。所以改成「一个 job 自己撑 2 小时，
+# 每 30 分钟抓一次，跑完再把自己排下一次」，schedule 只当兜底。
+on:
+  schedule:
+    - cron: "0 0,6,12,18 * * *"   # 兜底：每天 4 次（UTC）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: hourly-share
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: 装 ffmpeg（压缩 vlog 和漫画，runner 不自带）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg >/dev/null
+          ffmpeg -version | head -1
+
+      - name: 排下一次（先排队，本轮跑完自动接上）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh workflow run hourly-share.yml --repo "$GITHUB_REPOSITORY" \
+            && echo "已把下一次排进队列" \
+            || echo "排队失败，等 schedule 兜底"
+
+      - name: 循环抓取（4 轮 × 30 分钟 ≈ 2 小时）
+        env:
+          LOOKI_API_KEY: ${{ secrets.LOOKI_API_KEY }}
+          SHARE_PASS: ${{ secrets.SHARE_PASS }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "looki-bot"
+          git config user.email "looki-bot@users.noreply.github.com"
+          commit_push () {
+            git add -A
+            if git diff --cached --quiet; then echo "内容没变，不提交"; return 0; fi
+            git commit -m "update $(date -u +%F' '%H:%M)"
+            for i in 1 2 3 4 5; do
+              if git push; then echo pushed; return 0; fi
+              echo "push 失败，rebase 后重试 $i"
+              git pull --rebase --autostash origin main || true
+              sleep $((i*4))
+            done
+            echo "push 一直失败"
+          }
+          # 仓库只留最新版本：commit 数超过阈值就把历史压成一个无父提交（线上页面只读最新文件，
+          # 旧的每 2 小时重写一遍的页面没必要留在历史里，否则仓库会一直涨）
+          squash_history () {
+            local repo="$GITHUB_REPOSITORY" n
+            n=$(git rev-list --count HEAD)
+            if [ "$n" -lt 40 ]; then return 0; fi
+            echo "历史已有 $n 个提交，压缩成单提交"
+            local sha tree new
+            sha=$(gh api "repos/$repo/git/ref/heads/main" --jq .object.sha) || return 0
+            tree=$(gh api "repos/$repo/git/commits/$sha" --jq .tree.sha) || return 0
+            new=$(printf '{"message":"snapshot: 只保留最新版本","tree":"%s","parents":[]}' "$tree" \
+              | gh api "repos/$repo/git/commits" --input - --jq .sha) || return 0
+            gh api -X PATCH "repos/$repo/git/refs/heads/main" -f sha="$new" -F force=true >/dev/null \
+              && git fetch origin main -q && git reset --hard origin/main -q \
+              && echo "已压缩为单提交 $new"
+          }
+          # 页面上的「刷新」按钮会往 ntfy 主题投一条消息；这里边等边看，收到就提前跑下一轮
+          wait_refresh () {
+            local topic start now i
+            topic="looki-rf-$(printf 'looki-rf:%s' "$SHARE_PASS" | sha1sum | cut -c1-12)"
+            start=$(date +%s)
+            for i in $(seq 1 59); do
+              sleep 30
+              now=$(date +%s)
+              if [ $((now - start)) -ge 1800 ]; then return 0; fi
+              if curl -s --max-time 10 "https://ntfy.sh/$topic/json?poll=1&since=$((start - 5))" | grep -q '"event":"message"'; then
+                echo "收到立即刷新请求，提前进入下一轮"
+                return 0
+              fi
+            done
+          }
+          # 线上页面引用的每个 i/*、m/* 都得真的存在。少一张，那一页对用户来说就是
+          # 「高清图加载失败」/「视频打不开」。脚本在 build/verify-refs.js。
+          for r in 1 2 3 4; do
+            echo "::group::第 $r 轮 $(date -u +%H:%M)"
+            node build/share.mjs --days 7 --out . || echo "本轮构建失败，继续"
+            if [ -f build/verify-refs.js ]; then SHARE_PASS="$SHARE_PASS" node build/verify-refs.js || true; fi
+            commit_push || true
+            squash_history || true
+            echo "::endgroup::"
+            if [ "$r" != "4" ]; then wait_refresh; fi
+          done
